@@ -8,7 +8,6 @@ import dedupe
 from unidecode import unidecode
 
 def preProcess(column):
-    
     column = unidecode(column)
     column = re.sub("  +", " ", column)
     column = re.sub("\n", " ", column)
@@ -19,7 +18,6 @@ def preProcess(column):
     return column
 
 def readData(filename):
-    
     data_d = {}
     with open(filename) as f:
         reader = csv.DictReader(f)
@@ -62,7 +60,6 @@ if __name__ == "__main__":
         with open(settings_file, "rb") as f:
             deduper = dedupe.StaticDedupe(f)
     else:
-        
         fields = [
             dedupe.variables.String("REVISED_CUSTOMER_NAME"),
             dedupe.variables.String("REVISED_ADDRESS_LINE_1"),
@@ -79,15 +76,13 @@ if __name__ == "__main__":
             deduper.prepare_training(data_d)
             
             print("starting active labeling...")
-            
             dedupe.console_label(deduper)
-            
             deduper.train()
             
-            with open(training_file) as tf:
+            with open(training_file, "wb") as tf:
                 deduper.write_settings(tf)
             
-            with open(settings_file) as sf:
+            with open(settings_file, "wb") as sf:
                 deduper.write_settings(sf)
             
             print("clustering...")
@@ -96,15 +91,14 @@ if __name__ == "__main__":
             print("# duplicate sets", len(clustered_dupes))
             
             cluster_membership = {}
-    for cluster_id, (records, scores) in enumerate(clustered_dupes):
-        for record_id, score in zip(records, scores):
-            cluster_membership[record_id] = {
-                "Cluster ID": cluster_id,
-                "confidence_score": score,
-            }
+            for cluster_id, (records, scores) in enumerate(clustered_dupes):
+                for record_id, score in zip(records, scores):
+                    cluster_membership[record_id] = {
+                        "Cluster ID": cluster_id,
+                        "confidence_score": score,
+                    }
 
-    with open(output_file) as f_output, open(input_file) as f_input:
-
+    with open(output_file, "w", newline='') as f_output, open(input_file, "r") as f_input:
         reader = csv.DictReader(f_input)
         fieldnames = ["Cluster ID", "confidence_score"] + reader.fieldnames
 
@@ -113,5 +107,6 @@ if __name__ == "__main__":
 
         for row in reader:
             row_id = int(row["FUSION_SITE_USE_NUMBER"])
-            row.update(cluster_membership[row_id])
+            if row_id in cluster_membership:
+                row.update(cluster_membership[row_id])
             writer.writerow(row)
