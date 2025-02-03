@@ -1,0 +1,6 @@
+git add .
+git commit -m "Adding Readme"  
+git push -u origin main
+git branch
+git init
+git branch -m master main    # change name from master to main
