@@ -1,190 +1,86 @@
 import pandas as pd
 import numpy as np
-import multiprocessing as mp
 from rapidfuzz import fuzz
-from metaphone import doublemetaphone
-import textdistance
-from tqdm import tqdm
 import streamlit as st
-from typing import List, Dict
+from sklearn.cluster import DBSCAN
+import matplotlib.pyplot as plt
 
-# Address normalization dictionary
-ADDRESS_MAP = {
-    "street": "st",
-    "avenue": "ave",
-    "boulevard": "blvd",
-    "road": "rd",
-    "lane": "ln",
-    "drive": "dr",
-    "court": "ct",
-    "square": "sq"
-}
+# Function to calculate fuzzy match score between two rows using rapidfuzz
+def fuzzy_match(row1, row2):
+    combined1 = ' '.join([str(row1['name']), str(row1['address']), str(row1['city']), str(row1['postal_code'])])
+    combined2 = ' '.join([str(row2['name']), str(row2['address']), str(row2['city']), str(row2['postal_code'])])
+    return fuzz.ratio(combined1, combined2)
 
-# Configurable matching thresholds (adjust per field)
-THRESHOLDS = {
-    "name": 85,
-    "address": 90,
-    "city": 90,
-    "postal_code": 95
-}
+# Function to perform clustering and add cluster info to the DataFrame
+def get_clusters(df, threshold=80):
+    similarity_scores = []
 
-# Selectable matching techniques
-MATCHING_TECHNIQUES = {
-    "levenshtein": textdistance.levenshtein.normalized_similarity,
-    "jaro_winkler": textdistance.jaro_winkler.normalized_similarity,
-    "cosine": textdistance.cosine.normalized_similarity
-}
-
-def normalize_text(text: str) -> str:
-    """ Normalize text: lower case, remove extra spaces, and standardize addresses. """
-    text = str(text).lower().strip()
-    for word, abbrev in ADDRESS_MAP.items():
-        text = text.replace(word, abbrev)
-    return text
-
-def phonetic_encode(name: str) -> str:
-    """ Convert name to phonetic code (Metaphone). """
-    return doublemetaphone(name)[0]  # Primary Metaphone encoding
-
-def compute_similarity(val1: str, val2: str, method: str = "levenshtein") -> float:
-    """ Compute similarity score using the selected matching technique. """
-    if method in MATCHING_TECHNIQUES:
-        return MATCHING_TECHNIQUES[method](val1, val2) * 100  # Convert to percentage
-    return fuzz.ratio(val1, val2)  # Default to RapidFuzz
-
-def is_similar(record1: Dict[str, str], record2: Dict[str, str]) -> bool:
-    """ Check if two records are duplicates using field-specific thresholds. """
-    name_score = compute_similarity(record1['name_phonetic'], record2['name_phonetic'], "jaro_winkler")
-    address_score = compute_similarity(record1['address'], record2['address'], "levenshtein")
-    city_score = compute_similarity(record1['city'], record2['city'], "levenshtein")
-    postal_score = compute_similarity(record1['postal_code'], record2['postal_code'], "levenshtein")
-
-    return (name_score >= THRESHOLDS["name"] and
-            address_score >= THRESHOLDS["address"] and
-            city_score >= THRESHOLDS["city"] and
-            postal_score >= THRESHOLDS["postal_code"])
-
-def assign_clusters(records: List[Dict[str, str]]) -> List[int]:
-    """ Assigns cluster IDs to similar records. """
-    cluster_id = 1
-    clusters = [-1] * len(records)
-
-    for i in tqdm(range(len(records)), desc="Clustering"):
-        if clusters[i] != -1:
-            continue  # Skip already assigned
-
-        clusters[i] = cluster_id
-        cluster_size = 1
-
-        for j in range(i + 1, len(records)):
-            if clusters[j] == -1 and is_similar(records[i], records[j]):
-                clusters[j] = cluster_id
-                cluster_size += 1
-
-        # Assign cluster size to all records in the cluster
-        for k in range(len(clusters)):
-            if clusters[k] == cluster_id:
-                records[k]['cluster_size'] = cluster_size
-
-        cluster_id += 1  # Move to the next cluster
-
-    return clusters
-
-def process_chunk(df_chunk: pd.DataFrame) -> pd.DataFrame:
-    """ Process a chunk of data in parallel. """
-    df_chunk['name_phonetic'] = df_chunk['name'].apply(phonetic_encode)
-    df_chunk['address'] = df_chunk['address'].apply(normalize_text)
-    df_chunk['city'] = df_chunk['city'].str.lower()
-    df_chunk['postal_code'] = df_chunk['postal_code'].str.lower()
-
-    records = df_chunk.to_dict('records')
-    df_chunk['cluster_id'] = assign_clusters(records)
-
-    return df_chunk
-
-def run_deduplication(input_file: str, threshold_name: int, threshold_address: int, threshold_city: int, threshold_postal: int, matching_technique: str, delimiter: str) -> pd.DataFrame:
-    """ Main function to handle large datasets efficiently. """
-
-    df = pd.read_csv(input_file, delimiter=delimiter).fillna("")
+    for i, row1 in df.iterrows():
+        scores = []
+        for j, row2 in df.iterrows():
+            if i != j:
+                score = fuzzy_match(row1, row2)
+                if score >= threshold:
+                    scores.append((j, score))  # Store index and score if above threshold
+        similarity_scores.append(scores)
     
-    # Update thresholds dynamically
-    global THRESHOLDS
-    THRESHOLDS = {
-        "name": threshold_name,
-        "address": threshold_address,
-        "city": threshold_city,
-        "postal_code": threshold_postal
-    }
+    n = len(df)
+    distance_matrix = np.zeros((n, n))
+    
+    for i in range(n):
+        for j, score in similarity_scores[i]:
+            distance_matrix[i, j] = 100 - score  # Distance is 100 - similarity score
+            distance_matrix[j, i] = distance_matrix[i, j]  # Symmetric
+    
+    clustering = DBSCAN(metric="precomputed", min_samples=2, eps=20).fit(distance_matrix)
+    
+    df['cluster_id'] = clustering.labels_
+    df['cluster_size'] = df.groupby('cluster_id')['cluster_id'].transform('count')
+    df['link_score'] = [max([score for _, score in similarity_scores[i]], default=0) for i in range(n)]
+    
+    return df
 
-    # Ensure df is not empty before proceeding
-    if df.empty:
-        st.error("No valid data available for processing.")
-        return df
+# Streamlit UI components
+st.title("Fuzzy Deduplication Tool")
 
-    num_chunks = mp.cpu_count()  # Max CPU utilization
-    chunk_size = max(1, len(df) // num_chunks)
-    chunks = [df.iloc[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
+# File upload and delimiter option
+uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
 
-    with mp.Pool(num_chunks) as pool:
-        results = pool.map(process_chunk, chunks)
+if uploaded_file:
+    delimiter = st.selectbox("Select CSV Delimiter", [",", ";", "\t","|"], index=0)
+    df = pd.read_csv(uploaded_file, delimiter=delimiter)
+    
+    # Check if necessary columns exist
+    required_columns = ['name', 'address', 'city', 'postal_code']
+    for col in required_columns:
+        if col not in df.columns:
+            st.error(f'Missing required column: {col}')
+            st.stop()
 
-    final_df = pd.concat(results).sort_index()
-    return final_df
+    # Get fuzzy matching threshold from user
+    threshold = st.slider("Set Fuzzy Matching Threshold", 0, 100, 80)
 
-def main():
-    st.title('Deduplication Tool')
+    # Get clusters
+    df_with_clusters = get_clusters(df, threshold)
 
-    # File Upload
-    uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
+    # Display results in table
+    st.subheader("Clustered Data")
+    st.write(df_with_clusters[['name', 'address', 'city', 'postal_code', 'cluster_id', 'cluster_size', 'link_score']])
 
-    # Delimiter input
-    delimiter = st.selectbox("Select Delimiter", [",", ";", "\t", "|"], index=0)
+    # Visualize the clusters
+    st.subheader("Cluster Size Distribution")
+    fig, ax = plt.subplots()
+    df_with_clusters['cluster_size'].value_counts().plot(kind='bar', ax=ax)
+    ax.set_title("Cluster Size Distribution")
+    ax.set_xlabel("Cluster Size")
+    ax.set_ylabel("Frequency")
+    st.pyplot(fig)
 
-    if uploaded_file is not None:
-        try:
-            # Read uploaded file to show sample, with UTF-8 encoding
-            df = pd.read_csv(uploaded_file, delimiter=delimiter, encoding='utf-8')
-            st.write("Sample of Uploaded Data", df.head())
-        except Exception as e:
-            st.error(f"Error reading the file: {e}")
-            return
-
-        # Matching technique selection
-        matching_technique = st.selectbox(
-            "Choose Matching Technique",
-            ["levenshtein", "jaro_winkler", "cosine"]
-        )
-
-        # Threshold inputs for each field
-        threshold_name = st.slider("Threshold for Name Similarity", 0, 100, 85)
-        threshold_address = st.slider("Threshold for Address Similarity", 0, 100, 90)
-        threshold_city = st.slider("Threshold for City Similarity", 0, 100, 90)
-        threshold_postal = st.slider("Threshold for Postal Code Similarity", 0, 100, 95)
-
-        # Run deduplication
-        if st.button("Run Deduplication"):
-            st.write("Running deduplication...")
-            final_df = run_deduplication(
-                uploaded_file,
-                threshold_name,
-                threshold_address,
-                threshold_city,
-                threshold_postal,
-                matching_technique,
-                delimiter
-            )
-
-            # Display output and download option
-            if not final_df.empty:
-                st.write("Deduplicated Data", final_df)
-
-                # Option to download CSV file
-                st.download_button(
-                    label="Download Deduplicated CSV",
-                    data=final_df.to_csv(index=False, sep=delimiter),
-                    file_name="deduplicated_output.csv",
-                    mime="text/csv"
-                )
-
-if __name__ == "__main__":
-    main()
+    # Download processed file
+    csv = df_with_clusters.to_csv(index=False)
+    st.download_button(
+        label="Download Processed File",
+        data=csv,
+        file_name="deduplicated_file.csv",
+        mime="text/csv"
+    )
